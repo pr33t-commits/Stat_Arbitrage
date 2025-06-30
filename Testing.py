@@ -13,6 +13,11 @@ col_dict = {'open_price_col': 'open', 'high_price_col': 'high', 'low_price_col':
             'oi_col':'open_interest','date_col':'date','div_yield_col':'Div Yield %',
             'rfr_col':'MIBOR','returns_col':'returns'}
 
+import datetime
+import time
+from tqdm import tqdm
+tqdm.pandas()  
+
 class FnOBacktester:
     
     """
@@ -21,16 +26,17 @@ class FnOBacktester:
     
     """
     
-    SOD_TIME = datetime.time(9, 15)
+    SOD_TIME = datetime.time(9, 16)
     EOD_ACTION_TIME = datetime.time(15, 29) # Action time to close EOD positions
 
-    def __init__(self, initial_capital: float, ohlcv_data: pd.DataFrame, margin_rules: dict, preprocessing_required = False):
+    def __init__(self, initial_capital: float, ohlcv_data: dict, margin_rules: dict,backtest_start_date = None, backtest_end_date = None, 
+                 preprocessing_required = False, decision_frequency = 'min', additional_state_vars = None):
         
         """
         Initializes the backtester state.
         Args:
             initial_capital (float): The starting capital for the backtest.
-            ohlcv_data (pd.DataFrame): DataFrame containing OHLCV data indexed by timestamp.
+            ohlcv_data (dict): dictionary containing OHLCV data at different frquencies indexed by timestamp. Eg:- {'min':df1,'hour':df2}
             margin_rules (dict): A dictionary defining margin calculation rules.
                                   (Structure depends on broker/exchange specifics)
         """
@@ -48,7 +54,7 @@ class FnOBacktester:
         self.previous_candle = dict = {} 
         
         # --- Input Data & Rules ---
-        self.ohlcv_data: pd.DataFrame = ohlcv_data
+        self.ohlcv_data: dict = ohlcv_data
         self.expiry_mapper = {}
         self.margin_rules = margin_rules
         self.trained_model = None # Placeholder for the trading logic/model
@@ -59,9 +65,18 @@ class FnOBacktester:
         self.current_timestamp = None
         self.prev_timestamp = None
         
-        ## --- Preprocessing ---
+        ## --- Setup ---
+        self.backtest_start_date = pd.to_datetime(backtest_start_date) if backtest_start_date else pd.to_datetime(self.ohlcv_data[decision_frequency].index.min())
+        self.backtest_end_date = pd.to_datetime(backtest_end_date) if backtest_end_date else pd.to_datetime(self.ohlcv_data[decision_frequency].index.max())
         self.preprocessing_required = preprocessing_required
-    
+        self.decision_frequency = decision_frequency
+        self.ohlcv_data_bt = ohlcv_data[self.decision_frequency].loc[self.backtest_start_date:self.backtest_end_date].copy()
+
+        # Initialize additional state variables and their history properties
+        self.additional_state_vars = additional_state_vars if additional_state_vars else []
+        for var in self.additional_state_vars:
+            setattr(self, var + "_history", [])
+        
     def _is_sod(self, timestamp: pd.Timestamp) -> bool:
         """Checks if the given timestamp is Start of Day (SOD) for action."""
         return timestamp.time() == self.SOD_TIME
@@ -101,8 +116,8 @@ class FnOBacktester:
         # --- Variable Flow ---
         # Input: self.margin_maintained, pnl_current_step, self.current_position, self.margin_rules
         # Output: Boolean
-        print(f"Checking margin. Current: {self.margin_maintained}, PnL: {pnl_step_total}")
-        #current_prices = self.ohlcv_data.iloc[self.current_timestep_index] # Assuming 'close' prices for check
+        # print(f"Checking margin. Current: {self.margin_maintained}, PnL: {pnl_step_total}")
+
         required_margin = self._get_required_margin(position_to_evaluate = position_to_evaluate, 
                                                     current_prices = prices_for_checking)
         effective_margin = self.margin_maintained + pnl_step_total
@@ -150,7 +165,7 @@ class FnOBacktester:
             dict: Instrument: PnL incurred during the timestep.
         """        
         
-        print(f"Calculating PnL from {pre_previous_prices} to {previous_prices}")
+        # print(f"Calculating PnL from {pre_previous_prices} to {previous_prices}")
         pnl = {}
         for instrument,details in positions_to_evaluate.items():
             if not details['exit_idx']:    ## If the position is being squared off in this timestep or not 
@@ -169,7 +184,7 @@ class FnOBacktester:
                 curr_price_col = f"{col_dict['open_price_col']}_{instrument}"
                 pre_prices = previous_prices
                 post_prices = current_prices
-            price_diff = (post_prices[f"{curr_price_col}_{instrument}"] - pre_prices[f"{prev_price_col}_{instrument}"]) if details['type'] == 'long' else (pre_prices[f"{prev_price_col}_{instrument}"] - post_prices[f"{curr_price_col}_{instrument}"]) 
+            price_diff = (post_prices[curr_price_col] - pre_prices[prev_price_col]) if details['type'] == 'long' else (pre_prices[prev_price_col] - post_prices[curr_price_col]) 
             pnl[instrument] = details['qty']*price_diff
 
         return pnl
@@ -188,12 +203,12 @@ class FnOBacktester:
             float: The total required margin.
         """
         
-        print(f"Calculating required margin for position: {position_to_evaluate} at prices: {current_prices}")
+        # print(f"Calculating required margin for position: {position_to_evaluate} at prices: {current_prices}")
         
         required_margin = 0.0
         
         for instrument,details in position_to_evaluate.items():
-            inst = [i for i in self.margin_rules.keys() if i in instrument][0]
+            inst = 'NIFTY_FUT' # [i for i in self.margin_rules.keys() if i in instrument][0]
             if details['stage'] == 'maintenance':
                 required_margin += self.margin_rules[inst]['maintenance']*details['qty'] * current_prices[f"{price_col}_{instrument}"]
             elif details['stage'] == 'initial':
@@ -202,7 +217,7 @@ class FnOBacktester:
                 required_margin += self.margin_rules[inst]['margin_call']*details['qty'] * current_prices[f"{price_col}_{instrument}"]
         return required_margin
 
-    def generate_action_signal(self, historical_data_slice: pd.DataFrame) -> dict:
+    def generate_action_signal(self, historical_data_slice) -> dict:
         """
         Wrapper for the actual signal generation logic.
         Calls _generate_action_signal if defined, else raises NotImplementedError.
@@ -214,7 +229,7 @@ class FnOBacktester:
         else:
             raise NotImplementedError("You must implement _generate_action_signal in the child class.")
 
-    def finalize_action(self, action_signals: dict) -> dict:
+    def finalize_action(self, action_signals: dict, historical_data_slices) -> dict:
         
         """
         Wrapper for the actual action finalization logic.
@@ -222,11 +237,11 @@ class FnOBacktester:
         """
         
         if hasattr(self, '_finalize_action') and callable(getattr(self, '_finalize_action')):
-            final_actions = self._finalize_action(action_signals)
+            final_actions = self._finalize_action(action_signals,historical_data_slices)
             
             # Store the signal and the finalized action for analysis
             self.action_history.append({
-                'timestamp': self.ohlcv_data.index[self.current_timestep_index],
+                'timestamp': self.current_timestamp,
                 'signal': action_signals,
                 'final_action': final_actions
             })
@@ -273,7 +288,7 @@ class FnOBacktester:
         for instrument, details in actions.items():
             action = details['action']
             qty = details['qty']
-            inst = [i for i in margin_rules.keys() if i in instrument][0]
+            inst = 'NIFTY_FUT'#[i for i in margin_rules.keys() if i in instrument][0] ## implemented only for 1 instrument since margins are mainained seperately for diff kind of inst 
             price = current_prices.get(f"{instrument}_open", 0)
 
             if action == 'long':
@@ -338,14 +353,14 @@ class FnOBacktester:
         # self._calculate_current_holdings_value(current_prices)
 
         # Store the signal and the finalized action for analysis
-        for instrument, details in finalized_actions:
+        for instrument, details in finalized_actions.items():
             self.execution_history.append({
                 'timestamp': self.current_timestamp,
                 'instrument': instrument,
-                
+                'qty': details['qty'],
                 'final_action': details['action']
             })
-
+      
         # 5. Append pnl_last_step to self.pnl_history.
         for instrument, pnl in pnl_last_step.items():
             self.pnl_history.append({
@@ -356,12 +371,22 @@ class FnOBacktester:
         for pnl_exit in pnl_exit_positions:
             for instrument, pnl in pnl_exit.items():
                 self.pnl_history.append({
-                    'timestamp': self.ohlcv_data.index[self.current_timestep_index],
+                    'timestamp': self.current_timestamp,
                     'instrument': instrument,
                     'pnl': pnl
                 })
-        print(f"State updated. Capital: {self.available_capital}, Margin: {self.margin_maintained}")
+        # print(f"State updated. Capital: {self.available_capital}, Margin: {self.margin_maintained}")
         
+        # Save additional state variables if provided
+        for key in self.additional_state_vars:
+            if hasattr(self, key + "_history"):
+                getattr(self, key + "_history").append({
+                    'timestamp': self.current_timestamp,
+                    f"{key}_history": getattr(self, key)
+                })
+            else:
+                raise AttributeError(f"History property for '{key}' not initialized in the class.")
+    
     def check_state(self, capital, margin, position_to_evaluate, current_prices, checkpoint_indicator):
 
         if checkpoint_indicator == 'EOP':
@@ -387,7 +412,9 @@ class FnOBacktester:
                                     current_prices=current_prices, price_col = price_col)
                 remark = 'margin call'
                 if (capital - (required_margincall_margin - margin)  >= 0):
-                    return {'valid':False, 'action':'refill margin', 'remark':f'{remark} :- Sufficient funds','updated_state_vars':{'capital':capital - (required_margincall_margin - margin),
+                    return {'valid':False, 'action':'refill margin', 
+                            'remark':f'{remark} :- Sufficient funds',
+                            'updated_state_vars':{'capital':capital - (required_margincall_margin - margin),
                                                                                                             'margin':required_margincall_margin}}
                 else:
                     return {'valid':False, 'action':'square-off', 'remark':f'{remark} :- Insufficient funds'}
@@ -416,7 +443,7 @@ class FnOBacktester:
             pnl_last_step (float): PnL calculated for the last step *before* executing new trades.
         """
         
-        print(f"Updating state based on actions: {finalized_actions}")
+        # print(f"Updating state based on actions: {finalized_actions}")
 
         updated_position, updated_capital, pnl_exit_positions = self.apply_actions_to_position(current_position=self.current_position, 
                                                                                                            actions=finalized_actions,
@@ -441,17 +468,20 @@ class FnOBacktester:
         Runs the backtesting loop over the historical data. It is assumed that all this computation occurs after the end of a timestep
         and before start of next.
         """
+        
         if self.preprocessing_required:    
             print("Preprocessing")
+            print(self.preprocessing_required)
             self.preprocess()
 
         print("Starting backtest loop...")
         # Iterate through the data, leaving one step for final PnL/update
-        for i in range(len(self.ohlcv_data) - 1):
+        for i in tqdm(range(len(self.ohlcv_data_bt) - 1)):
+            start_time = time.time()  # Start timing the loop iteration
             self.current_timestep_index = i
-            self.current_timestamp = self.ohlcv_data.index[i]
-            self.prev_timestamp = self.ohlcv_data.index[i-1] if i > 0 else self.current_timestamp # The timestep which ended
-            print(f"\n--- Timestep: {self.current_timestamp} (Index: {i}) ---")
+            self.current_timestamp = self.ohlcv_data_bt.index[i]
+            self.prev_timestamp = self.ohlcv_data_bt.index[i-1] if i > 0 else self.current_timestamp # The timestep which ended
+            # print(f"\n--- Timestep: {self.current_timestamp} (Index: {i}) ---")
             
             
             ## Input ohlcv data has columns for each timepoint as 'high_near','high_mid','high_far','open_near'...etc. Following lines 
@@ -459,9 +489,10 @@ class FnOBacktester:
             ## columns corresponding to equities remain the same i.e. 'high_equity','low_equity'..etc.
             rename_cols = [col_dict['open_price_col'],col_dict['high_price_col'], col_dict['low_price_col'], col_dict['close_price_col'],
                            col_dict['returns_col']]            
-            current_prices = self.ohlcv_data.iloc[i]
+            current_prices = self.ohlcv_data_bt.iloc[i]
 
-            previous_prices = self.ohlcv_data.iloc[i-1]
+            previous_prices = self.ohlcv_data_bt.iloc[i-1]
+            
             
             if self.preprocessing_required:
                 current_prices = current_prices.rename(columns = {f'{col}_{exp}':f'{col}_FUT_{self.expiry_mapper[self.current_timestamp][exp]}' 
@@ -471,14 +502,16 @@ class FnOBacktester:
                                                                        for col in rename_cols 
                                                                        for exp in ['near','mid','far']}).to_dict() if i > 0 else current_prices # The timestep which ended
             
+            # Measure time for PnL calculation
+            pnl_start = time.time()
             # 1. Calculate PnL from the change in position value during the last step
             pnl_step = self._calculate_pnl(positions_to_evaluate=self.current_position,
                                            pre_previous_prices=self.previous_candle,
                                            previous_prices=previous_prices)
             
             pnl_step_total = sum(list(pnl_step.values()))
-            print(f"PnL for step: {pnl_step_total}")
-            
+            # print(f"PnL for step: {pnl_step_total}")
+            print(f"PnL for step: {pnl_step_total} (Time: {time.time() - pnl_start:.2f}s)")
             self.margin_maintained += pnl_step_total
 
             state_check_eop = self.check_state(capital = self.available_capital,
@@ -492,22 +525,27 @@ class FnOBacktester:
                     finalized_actions = {} # Build square-off actions here
                     for inst, details in self.current_position.items():
                         finalized_actions[inst] = {'action': 'square-off', 'qty': details['qty']}
-                    self.update_state(finalized_actions=finalized_actions, 
+                    proposed_position, proposed_capital ,proposed_pnl = self.update_state(finalized_actions=finalized_actions, 
                                       previous_prices = previous_prices,
                                       current_prices = current_prices)
+                    self.available_capital = proposed_capital
+                    self.margin_maintained = 0
+
+                    self.save_state_history(finalized_actions=finalized_actions,
+                                            pnl_last_step=pnl_step,pnl_exit_positions=proposed_pnl)
                     continue
                 else:
                     self.available_capital = state_check_eop['updated_state_vars']['capital']
                     self.margin_maintained = state_check_eop['updated_state_vars']['margin']
             
             # 3. If margin is okay, generate trading signal
-            print("Margin OK.")
+            # print("Margin OK.")
             # Define the slice of data to pass to the signal generator
-            historical_data_slice = self.ohlcv_data.iloc[:i] # Data up to  current step
-            action_signals = self.generate_action_signal(historical_data_slice)
-
+            historical_data_slices = {freq:ohlcv.loc[ohlcv.index<self.current_timestamp] for freq,ohlcv in self.ohlcv_data.items()} # Data up to  current step for each frequency data
+            action_signals = self.generate_action_signal(historical_data_slices)
+            
             # 4. Finalize actions based on signals and constraints
-            finalized_actions = self.finalize_action(action_signals)
+            finalized_actions = self.finalize_action(action_signals,historical_data_slices)
             self.previous_candle = previous_prices
             # 5. Update state based on finalized actions
             # Note: PnL calculated earlier is passed to update state correctly
@@ -518,7 +556,7 @@ class FnOBacktester:
             state_check_sop = self.check_state(capital = self.available_capital,
                                                margin = self.margin_maintained,
                                                position_to_evaluate = proposed_position,
-                                               current_prices=current_prices,
+                                               current_prices = current_prices,
                                                checkpoint_indicator = 'SOP')
             
             if not state_check_sop['valid']:
@@ -526,20 +564,24 @@ class FnOBacktester:
                     self.available_capital = state_check_sop['updated_state_vars']['capital']
                     self.margin_maintained = state_check_sop['updated_state_vars']['margin']
                     self.current_position = proposed_position
-                    self.save_state_history()
+                    print(finalized_actions)
+                    self.save_state_history(finalized_actions=finalized_actions,
+                                            pnl_last_step=pnl_step, 
+                                            pnl_exit_positions=proposed_pnl)
+
                 else:
                     # insufficient margin and funds for the prop action, do nothing
                     finalized_actions = {}
-                self.save_state_history(finalized_actions, pnl_last_step=pnl_step, pnl_exit_positions=[])
+                    self.save_state_history(finalized_actions, pnl_last_step=pnl_step, pnl_exit_positions=[])
+
             else:
                 ## no change to margin and capital since current margin amount covers total req amount
                 self.current_position = proposed_position
-                self.save_state_history(finalized_actions, pnl_last_step=pnl_step,pnl_exit_positions= proposed_pnl)
-            
-        print("\n--- Backtest Finished ---")
-        # Final calculations (e.g., total PnL, Sharpe ratio) can be done here
-        # using self.pnl_history, self.action_history etc.
+                self.save_state_history(finalized_actions, pnl_last_step=pnl_step,
+                                        pnl_exit_positions= proposed_pnl)
 
+        print("\n--- Backtest Finished ---")
+     
 class NaiveStrategyBacktester(FnOBacktester):
     """
     Implements a naive trading strategy for 1-minute data:
@@ -791,115 +833,88 @@ class CopulaModel:
         self.model.fit(copula_uv, method='ml', to_pobs=False, verbose=3)
         print(self.model._fit_smry)
         
-    def pdf(x,y):
+    def pdf(self,x,y):
         u = self.ecdf_x(x)
         v = self.ecdf_y(y)
         return self.model.pdf(np.array([np.clip(u,self.eps, 1 - self.eps),
                                         np.clip(v, self.eps, 1 - self.eps)]), log=False)
     
     def cond_prob_x_given_y(self, x_val,y_val):
-        pdf_fixed_y = partial(self.pdf, y = y_val)
-        numerator,error,info, message = quad(pdf_fixed_y, -np.inf, x_val, full_output=1,
-                                     limit = 1000, 
+        # pdf_fixed_y = partial(self.pdf, y = y_val)
+        def pdf_fixed_y(x):
+            return self.pdf(x, y_val)
+        numerator,error = quad(pdf_fixed_y, -np.inf, x_val,# full_output=1,
+                                     limit = 50, 
                                      epsabs=1e-10,
                                      epsrel=1e-10)
         denominator = numerator + quad(pdf_fixed_y, x_val, np.inf)[0]
+        # print(f"Numerator: {numerator:.8f}, Denominator: {denominator:.8f}, Error: {error:.2e}")
         return numerator/ denominator
     
     def cond_prob_y_given_x(self, x_val,y_val):
-        pdf_fixed_x = partial(self.pdf, x = x_val)
-        numerator,error,info, message = quad(pdf_fixed_x, -np.inf, y_val, full_output=1,
-                                     limit = 1000, 
+        
+        def pdf_fixed_x(y):
+            return self.pdf(x_val, y)
+        # pdf_fixed_x = partial(self.pdf, x = x_val)
+        numerator,error = quad(pdf_fixed_x, -np.inf, y_val, #full_output=1,
+                                     limit = 50, 
                                      epsabs=1e-10,
                                      epsrel=1e-10)
         denominator = numerator + quad(pdf_fixed_x, y_val, np.inf)[0]
+        # print(f"Numerator: {numerator:.8f}, Denominator: {denominator:.8f}, Error: {error:.2e}")
         return numerator/ denominator
 
-class DummyCopulaModel:
-    def __init__(self):
-        self.params = None
-
-    def fit(self, returns_x, returns_y):
-        """
-        Dummy fit method for the copula model.
-        Args:
-            returns_x (pd.Series): Returns of X.
-            returns_y (pd.Series): Returns of Y.
-        """
-        # Store the mean and standard deviation of the returns as dummy parameters
-        self.params = {
-            'mean_x': np.mean(returns_x),
-            'std_x': np.std(returns_x),
-            'mean_y': np.mean(returns_y),
-            'std_y': np.std(returns_y)
-        }
-        print(f"DummyCopulaModel fitted with params: {self.params}")
-
-    def cond_prob_x_given_y(self, returns_x, returns_y):
-        """
-        Dummy method to compute conditional probability of X given Y.
-        Args:
-            returns_x (float): Return of X.
-            returns_y (float): Return of Y.
-        Returns:
-            float: A dummy conditional probability.
-        """
-        if self.params is None:
-            raise ValueError("Model is not fitted yet.")
-        # Dummy logic: Use a simple linear relationship
-        return 0.5 + 0.1 * (returns_y - self.params['mean_y']) / self.params['std_y']
-
-    def cond_prob_y_given_x(self, returns_y, returns_x):
-        """
-        Dummy method to compute conditional probability of Y given X.
-        Args:
-            returns_y (float): Return of Y.
-            returns_x (float): Return of X.
-        Returns:
-            float: A dummy conditional probability.
-        """
-        if self.params is None:
-            raise ValueError("Model is not fitted yet.")
-        # Dummy logic: Use a simple linear relationship
-        return 0.5 + 0.1 * (returns_x - self.params['mean_x']) / self.params['std_x']
-
-
+  
 # ...existing code...
 class CopulaBacktester(FnOBacktester):
-    def __init__(self, initial_capital, ohlcv_data, ohlcv_daily_data, margin_rules, 
-                 copula_model,copula_model_daily, x_col, y_col,MPI_threshold = 0.6 ,refitting_frequency = 1):
-        super().__init__(initial_capital, ohlcv_data, margin_rules)
+    def __init__(self, initial_capital, ohlcv_data, margin_rules, copula_model,copula_model_daily, 
+                 instrument1, instrument2 ,returns_min, returns_daily, backtest_start_date = None, backtest_end_date = None,
+                 MPI_threshold = 0.6 ,refitting_frequency = 1, additional_state_vars = None):
+        
+        super().__init__(initial_capital, ohlcv_data, margin_rules, backtest_start_date, 
+                         backtest_end_date,additional_state_vars=additional_state_vars)
         self.copula_model = copula_model  # Should have a method to compute conditional probabilities
         self.copula_model_daily = copula_model_daily  # Should have a method to compute conditional probabilities
-        self.ohlcv_daily_data = ohlcv_daily_data
-        self.x_col = x_col  # e.g., 'NIFTY_FUT'
-        self.y_col = y_col  # e.g., 'BANKNIFTY_FUT'
+        # self.ohlcv_daily_data = ohlcv_daily_data
+        self.instrument1 = instrument1  # e.g., 'NIFTY_FUT'
+        self.instrument2 = instrument2  # e.g., 'BANKNIFTY_FUT'
+        self.returns_min = returns_min
+        self.returns_daily = returns_daily
         self.MPI_threshold = MPI_threshold
-        self.flag_x = 0.0
-        self.flag_y = 0.0
-        self.flag_x_basis = None  # 'X' or 'Y' or None
-        self.flag_y_basis = None
+        self.flag_1 = 0.0
+        self.flag_2 = 0.0
+        self.flag_1_basis = None  # 'X' or 'Y' or None
+        self.flag_2_basis = None
         self.spread_traded = None
         self.gaurdrail_exceeded = None
         self.refitting_frequency = refitting_frequency  # in days
         self.last_refit_date = None  # Track last refit date
 
+            
     def compute_mispricing_indices(self, copula_model, returns_x, returns_y):
         # Placeholder: Replace with your copula model's method
         mi_x_given_y = copula_model.cond_prob_x_given_y(returns_x, returns_y)
-        mi_y_given_x = copula_model.cond_prob_y_given_x(returns_y, returns_x)
+        mi_y_given_x = copula_model.cond_prob_y_given_x(returns_x, returns_y)
+        
         return mi_x_given_y, mi_y_given_x
 
-    def _generate_action_signal(self, historical_data_slice : pd.DataFrame, 
-                                historical_daily_data_slice : pd.DataFrame,
-                                previous_prices,
-                                previous_prices_daily) -> dict:
+    def _generate_action_signal(self, historical_data_slices : dict) -> dict:
+        
+        historical_data_slice_min = historical_data_slices['min']
+        historical_data_slices_day = historical_data_slices['day']
+        
+        previous_ts = historical_data_slice_min.iloc[-1].to_dict()
+        previous_ts_daily = historical_data_slices_day.iloc[-1].to_dict()
+        
+        # print(f'{self.returns_min}_{self.instrument1}', f'{self.returns_min}_{self.instrument2}')
+        # print(previous_prices[f'{self.returns_min}_{self.instrument1}'], previous_prices[f'{self.returns_min}_{self.instrument2}'])
+        
         # Get latest returns for X and Y
-        if len(historical_data_slice) < 2:
+        if len(historical_data_slice_min) < 2:
             return {}
 
         # Determine if refit is needed
-        current_date = historical_data_slice.index[-1].date()
+        current_date = self.current_timestamp.date()
         if self.last_refit_date is None:
             need_refit = True
         else:
@@ -908,106 +923,139 @@ class CopulaBacktester(FnOBacktester):
 
         if need_refit:
             # Fit copula model using historical_data_slice
-            returns_df = historical_data_slice[[self.x_col,self.y_col]].dropna()
-            self.copula_model.fit(returns_df[self.x_col], returns_df[self.y_col])
+            returns_cols = [f'{self.returns_min}_{self.instrument1}',f'{self.returns_min}_{self.instrument2}']
+            self.copula_model.fit(historical_data_slice_min,returns_cols)
             
-            daily_returns_df = historical_daily_data_slice[[self.x_col,self.y_col]].dropna()
-            self.copula_model_daily.fit(daily_returns_df[self.x_col], daily_returns_df[self.y_col])
+            returns_cols_day = [f'{self.returns_daily}_{self.instrument1}',f'{self.returns_daily}_{self.instrument2}']
+            self.copula_model_daily.fit(historical_data_slices_day, returns_cols_day)
             
             self.last_refit_date = current_date
         
-        if self._is_sod(self.current_timestamp):
-            returns_x = previous_prices_daily[self.x_col]
-            returns_y = previous_prices_daily[self.y_col]
-            mi_x_given_y, mi_y_given_x = self.compute_mispricing_indices(copula_model=self.copula_model_daily,
-                                                                         returns_x=returns_x, returns_y=returns_y)
-        else:
-            returns_x = previous_prices[self.x_col]
-            returns_y = previous_prices[self.y_col]
-            mi_x_given_y, mi_y_given_x = self.compute_mispricing_indices(copula_model=self.copula_model,
-                                                                         returns_x=returns_x, returns_y=returns_y)
-            
-        
+        # Check if it is EOD of the expiry date for either instrument
+        expiry_date_1 = pd.to_datetime(previous_ts[f"{col_dict['expiry_col']}_{self.instrument1}"])
+        expiry_date_2 = pd.to_datetime(previous_ts[f"{col_dict['expiry_col']}_{self.instrument1}"])
+        if self._is_eod_action_time(self.current_timestamp) and (self.current_timestamp.date() == expiry_date_1.date() or 
+                                                                 self.current_timestamp.date() == expiry_date_2.date()):
+            action_signals = {}
+            for instrument in [self.instrument1, self.instrument2]:
+                if instrument in self.current_position:
+                    action_signals[instrument] = 'square-off'
+            self.flag_1 = 0.0
+            self.flag_2 = 0.0
+            self.spread_traded = None
+            return action_signals
 
+        
+        if self._is_sod(self.current_timestamp):
+            returns_1 = previous_ts_daily[f'{self.returns_daily}_{self.instrument1}']
+            returns_1 = returns_1 if not pd.isna(returns_1) else 0
+            returns_2 = previous_ts_daily[f'{self.returns_daily}_{self.instrument2}']
+            returns_2 = returns_2 if not pd.isna(returns_2) else 0
+            # print(previous_prices_daily.index)
+            # print(f" Returns near {returns_1:.8f}", f" Returns Mid {returns_2:.8f}")
+            mi_x_given_y, mi_y_given_x = self.compute_mispricing_indices(copula_model=self.copula_model_daily,
+                                                                         returns_x=returns_1, returns_y=returns_2)
+        else:
+            returns_1 = previous_ts[f'{self.returns_min}_{self.instrument1}']
+            returns_1 = returns_1 if not pd.isna(returns_1) else 0
+            returns_2 = previous_ts[f'{self.returns_min}_{self.instrument2}']
+            returns_2 = returns_2 if not pd.isna(returns_2) else 0
+            # print(f" Returns near {returns_1:.8f}", f" Returns Mid {returns_2:.8f}")
+            mi_x_given_y, mi_y_given_x = self.compute_mispricing_indices(copula_model=self.copula_model,
+                                                                         returns_x=returns_1, 
+                                                                         returns_y=returns_2)
+        
+        ## Sign of previous flag values
+        sign_flag_1 = 1 if self.flag_1 > 0 else -1
+        sign_flag_2 = 1 if self.flag_2 > 0 else -1
+        
         # Update flags
-        self.flag_x += (mi_x_given_y - 0.5)
-        self.flag_y += (mi_y_given_x - 0.5)
+        self.flag_1 += (mi_x_given_y - 0.5)
+        self.flag_2 += (mi_y_given_x - 0.5)
 
         action_signals = {}
         threshold = self.MPI_threshold
         # Open Rules
-        if (self.flag_x >= threshold) and (not self.spread_traded):
-            action_signals[self.x_col] = 'short'
-            action_signals[self.y_col] = 'long'
-            self.flag_x_basis = 'X'
+        if (self.flag_1 >= threshold) and (not self.spread_traded):
+            action_signals[self.instrument1] = 'short'
+            action_signals[self.instrument2] = 'long'
+            self.flag_1_basis = 'X'
             self.spread_traded = 'X_Y'
-        elif self.flag_x <= -threshold and (not self.spread_traded):
-            action_signals[self.x_col] = 'long'
-            action_signals[self.y_col] = 'short'
-            self.flag_x_basis = 'X'
+            
+        elif self.flag_2 <= -threshold and (not self.spread_traded):
+            action_signals[self.instrument1] = 'long'
+            action_signals[self.instrument2] = 'short'
+            self.flag_1_basis = 'X'
             self.spread_traded = 'Y_X'
-        elif self.flag_y >= threshold and (not self.spread_traded):
-            action_signals[self.x_col] = 'long'
-            action_signals[self.y_col] = 'short'
-            self.flag_y_basis = 'Y'
+        
+        elif self.flag_2 >= threshold and (not self.spread_traded):
+            action_signals[self.instrument1] = 'long'
+            action_signals[self.instrument2] = 'short'
+            self.flag_2_basis = 'Y'
             self.spread_traded = 'Y_X'
-        elif self.flag_y <= -threshold and (not self.spread_traded):
-            action_signals[self.x_col] = 'short'
-            action_signals[self.y_col] = 'long'
-            self.flag_y_basis = 'Y'
+        
+        elif self.flag_2 <= -threshold and (not self.spread_traded):
+            action_signals[self.instrument1] = 'short'
+            action_signals[self.instrument2] = 'long'
+            self.flag_2_basis = 'Y'
             self.spread_traded = 'X_Y'
+        
         else:
-            action_signals[self.x_col] = 'hold'
-            action_signals[self.y_col] = 'hold'
+            action_signals[self.instrument1] = 'hold'
+            action_signals[self.instrument2] = 'hold'
+        
         # Exit Rules
         # If trades are open based on FlagX, exit if FlagX returns to 0 or reaches ±2
-        if self.flag_x_basis == 'X' and (abs(self.flag_x) >= 2 or abs(self.flag_x) < 1e-6):
-            action_signals[self.x_col] = 'square-off'
-            action_signals[self.y_col] = 'square-off'
-            self.flag_x = 0.0
-            self.flag_x_basis = None
+        if self.flag_1_basis == 'X' and ((abs(self.flag_1) >= 2) or (sign_flag_1 * self.flag_1 < 0)):
+            action_signals[self.instrument1] = 'square-off'
+            action_signals[self.instrument2] = 'square-off'
+            if abs(self.flag_1) >= 2:
+                self.flag_1 = 0.0
+                self.gaurdrail_exceeded = f'X_{self.flag_1}'
+            self.flag_1_basis = None
             self.spread_traded = None
-            self.gaurdrail_exceeded = f'X_{self.flag_x}'
+        if abs(self.flag_1) >= 2:
+            self.flag_1 = 0.0
+            self.gaurdrail_exceeded = f'X_{self.flag_1}'
 
         # If trades are open based on FlagY, exit if FlagY returns to 0 or reaches ±2
-        if self.flag_y_basis == 'Y' and (abs(self.flag_y) >= 2 or abs(self.flag_y) < 1e-6):
-            action_signals[self.x_col] = 'square-off'
-            action_signals[self.y_col] = 'square-off'
-            self.flag_y = 0.0
-            self.flag_y_basis = None
+        if self.flag_2_basis == 'Y' and ((abs(self.flag_2) >= 2 )or (sign_flag_2 * self.flag_2 < 0)):
+            action_signals[self.instrument1] = 'square-off'
+            action_signals[self.instrument2] = 'square-off'
+            if abs(self.flag_2) >= 2:
+                self.flag_2 = 0.0
+                self.gaurdrail_exceeded = f'X_{self.flag_2}'
+            self.flag_2_basis = None
             self.spread_traded = None
-            self.gaurdrail_exceeded = f'X_{self.flag_y}'
-
+        if abs(self.flag_2) >= 2:
+            self.flag_2 = 0.0
+            self.gaurdrail_exceeded = f'X_{self.flag_2}'
         return action_signals
 
-    def _finalize_action(self, action_signals: dict) -> dict:
+    def _finalize_action(self, action_signals: dict, historical_data_slices) -> dict:
         # Use available capital and margin to determine max possible qty
         final_actions = {}
-        prices = self.ohlcv_data.iloc[self.current_timestep_index - 1].to_dict()
-        min_qty = 1  # You can parameterize this
-
-        # Only open new positions if margin allows
-        if self.spread_traded:
-            instruments = [i for i in self.margin_rules.keys() for instrument in action_signals.keys() if i in instrument][0] ## implemented only for 1 instrument since margins are mainained seperately for diff kind of inst 
-            margin_per_unit = sum([self.margin_rules[inst]['initial'] * prices[f'close_{inst}'] for inst in instruments])
-            qty = int(self.available_capital // margin_per_unit)
         
+        prices = historical_data_slices['min'].iloc[-1].to_dict() 
+        margin_per_unit = 0
+            
         for inst, action in action_signals.items():
-            if action in ['long', 'short']:
-                price = prices.get(f"{inst}_close", 0)
-                inst_rule = [k for k in self.margin_rules if k in inst][0]
-                margin_per_unit += self.margin_rules[inst_rule]['initial'] * price
-        
+            if action in ['long' , 'short']:
+                price = prices.get(f'{col_dict['close_price_col']}_{inst}', 0)
+                # inst_rule = [k for k in self.margin_rules if k in inst][0]
+                margin_per_unit += self.margin_rules['NIFTY_FUT']['initial'] * price ## implemented only for 1 instrument since margins are mainained seperately for diff kind of inst 
+
             elif action == 'square-off':
                 # Square-off all current position
                 if inst in self.current_position:
                     qty = self.current_position[inst]['qty']
                     final_actions[inst] = {'action': 'square-off', 'qty': qty}
-                return final_actions
-            
-        qty = int(self.available_capital // margin_per_unit)
-        if qty > 0:
-            final_actions[inst] = {'action': action, 'qty': qty}
+                
+        qty = int(self.available_capital // margin_per_unit) if margin_per_unit > 0 else -1  # Only open new positions if margin allows
+        
+        if (qty > 0):
+            final_actions = {inst:{'action': action, 'qty': qty} for inst, action in action_signals.items()}
+        
         return final_actions
 
 # ...existing code...
