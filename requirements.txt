@@ -1,0 +1,12 @@
+pandas
+numpy
+pandas-market-calendars
+matplotlib
+seaborn
+hyppo
+future
+copulas
+statsmodels
+copulae
+pytest
+tqdm
